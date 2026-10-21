@@ -1149,6 +1149,109 @@ void * WINAPI RtlFindExportedRoutineByName( HMODULE module, const char *name )
 }
 
 
+#ifdef _WIN64
+/*************************************************************************
+ *		steamclient trampolines
+ *
+ * Route the native Windows steamclient64.dll into the builtin lsteamclient, which
+ * bridges to the host Steam client. Same behaviour as Proton's ntdll hack
+ * (ValveSoftware/wine c177a34d, 1788b235, bb6514f4, b1cce9c4), but the jumps are
+ * written from the PE side through NtProtectVirtualMemory instead of a unix call,
+ * and only 64-bit modules are handled.
+ */
+static BOOL use_lsteamclient(void)
+{
+    static int use = -1;
+    WCHAR env[32];
+
+    if (use != -1) return use;
+    use = !((get_env( L"WINE_DISABLE_LSTEAMCLIENT", env, sizeof(env) ) && *env != '0') ||
+            (get_env( L"PROTON_DISABLE_LSTEAMCLIENT", env, sizeof(env) ) && *env != '0'));
+    if (!use) ERR( "lsteamclient disabled.\n" );
+    return use;
+}
+
+static BOOL is_steamclient64( const UNICODE_STRING *nt_name )
+{
+    const WCHAR *base = nt_name->Buffer;
+    ULONG i, len = nt_name->Length / sizeof(WCHAR);
+
+    for (i = 0; i < len; i++)
+        if (nt_name->Buffer[i] == '\\' || nt_name->Buffer[i] == '/') base = nt_name->Buffer + i + 1;
+    len -= base - nt_name->Buffer;
+    if (len >= 4 && !RtlCompareUnicodeStrings( base + len - 4, 4, L".dll", 4, TRUE )) len -= 4;
+    return !RtlCompareUnicodeStrings( base, len, L"steamclient64", 13, TRUE );
+}
+
+/* mov rax, imm64; jmp rax */
+static void steamclient_write_jump( void *src, const void *tgt )
+{
+    BYTE *p = src;
+    ULONG_PTR addr = (ULONG_PTR)tgt;
+
+    p[0] = 0x48;
+    p[1] = 0xb8;
+    memcpy( p + 2, &addr, sizeof(addr) );
+    p[10] = 0xff;
+    p[11] = 0xe0;
+}
+
+static void steamclient_protect_code( HMODULE module, const IMAGE_NT_HEADERS *nt, BOOL writable )
+{
+    const IMAGE_SECTION_HEADER *sec = IMAGE_FIRST_SECTION( nt );
+    SIZE_T size;
+    void *addr;
+    DWORD prot, old;
+    WORD i;
+
+    for (i = 0; i < nt->FileHeader.NumberOfSections; i++)
+    {
+        if (!(sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
+        if (writable || (sec[i].Characteristics & IMAGE_SCN_MEM_WRITE)) prot = PAGE_EXECUTE_READWRITE;
+        else prot = PAGE_EXECUTE_READ;
+        addr = (char *)module + sec[i].VirtualAddress;
+        size = sec[i].Misc.VirtualSize;
+        NtProtectVirtualMemory( NtCurrentProcess(), &addr, &size, prot, &old );
+    }
+}
+
+static void steamclient_setup_trampolines( HMODULE src_mod, HMODULE tgt_mod, SIZE_T map_size )
+{
+    const IMAGE_NT_HEADERS *src_nt = RtlImageNtHeader( src_mod ), *tgt_nt = RtlImageNtHeader( tgt_mod );
+    const IMAGE_EXPORT_DIRECTORY *exports;
+    const DWORD *names;
+    unsigned int count = 0;
+    DWORD i, exp_size;
+    void *src, *tgt;
+
+    steamclient_protect_code( src_mod, src_nt, TRUE );
+
+    exports = RtlImageDirectoryEntryToData( src_mod, TRUE, IMAGE_DIRECTORY_ENTRY_EXPORT, &exp_size );
+    if (exports && exp_size >= sizeof(*exports))
+    {
+        names = get_rva( src_mod, exports->AddressOfNames );
+        for (i = 0; i < exports->NumberOfNames; i++)
+        {
+            const char *name = get_rva( src_mod, names[i] );
+
+            if (!(src = RtlFindExportedRoutineByName( src_mod, name ))) continue;
+            if (!(tgt = RtlFindExportedRoutineByName( tgt_mod, name ))) continue;
+            steamclient_write_jump( src, tgt );
+            count++;
+        }
+    }
+
+    if (src_nt->OptionalHeader.AddressOfEntryPoint && tgt_nt->OptionalHeader.AddressOfEntryPoint)
+        steamclient_write_jump( (char *)src_mod + src_nt->OptionalHeader.AddressOfEntryPoint,
+                                (char *)tgt_mod + tgt_nt->OptionalHeader.AddressOfEntryPoint );
+
+    steamclient_protect_code( src_mod, src_nt, FALSE );
+    NtFlushInstructionCache( NtCurrentProcess(), src_mod, map_size );
+    TRACE( "routed %u steamclient64 exports to lsteamclient\n", count );
+}
+#endif
+
+
 /*************************************************************************
  *		import_dll
  *
@@ -1185,6 +1288,17 @@ static BOOL import_dll( WINE_MODREF *wm, const IMAGE_IMPORT_DESCRIPTOR *descr, L
         *pwm = NULL;
         return TRUE;
     }
+
+#ifdef _WIN64
+    /* a trampolined steamclient64 must not drag in Steam's own tier0/vstdlib and their DllMains */
+    if ((wm->ldr.Flags & LDR_DONT_CALL_DLLMAIN) &&
+        (!strcmp( name, "tier0_s64.dll" ) || !strcmp( name, "vstdlib_s64.dll" )))
+    {
+        TRACE( "%s -> ntdll.dll\n", name );
+        name = "ntdll.dll";
+        len = strlen( name );
+    }
+#endif
 
     status = build_import_name( wm, buffer, name, len );
     if (!status) status = load_dll( load_path, buffer, 0, &wmImp, system );
@@ -1710,7 +1824,7 @@ static NTSTATUS MODULE_InitDLL( WINE_MODREF *wm, UINT reason, LPVOID lpReserved 
 
     /* Skip calls for modules loaded with special load flags */
 
-    if (wm->ldr.Flags & LDR_DONT_RESOLVE_REFS) return STATUS_SUCCESS;
+    if (wm->ldr.Flags & (LDR_DONT_RESOLVE_REFS | LDR_DONT_CALL_DLLMAIN)) return STATUS_SUCCESS;
     if (wm->ldr.TlsIndex == -1) call_tls_callbacks( wm->ldr.DllBase, reason );
     if (!entry) return STATUS_SUCCESS;
 
@@ -2324,6 +2438,21 @@ static NTSTATUS build_module( LPCWSTR load_path, const UNICODE_STRING *nt_name, 
     wm->system = system;
 
     update_load_config( *module );
+
+#ifdef _WIN64
+    if (!is_builtin && is_steamclient64( nt_name ) && use_lsteamclient())
+    {
+        static HMODULE lsteamclient;
+        UNICODE_STRING name = RTL_CONSTANT_STRING( L"lsteamclient.dll" );
+
+        if (lsteamclient || !LdrLoadDll( load_path, NULL, &name, &lsteamclient ))
+        {
+            steamclient_setup_trampolines( *module, lsteamclient, map_size );
+            wm->ldr.Flags |= LDR_DONT_CALL_DLLMAIN;
+        }
+        else ERR( "failed to load lsteamclient.dll, leaving %s native\n", debugstr_us( nt_name ) );
+    }
+#endif
 
     /* fixup imports */
 
